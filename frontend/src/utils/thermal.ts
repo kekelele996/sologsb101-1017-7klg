@@ -5,8 +5,9 @@
  * - 温度单位换算（℃ ↔ ℉）
  * - 工艺温度区间与设计尺寸校验
  */
-import type { Anneal, CurveSeg } from '../types/anneal'
+import type { Anneal, AnnealState, CurveSeg } from '../types/anneal'
 import type { Craft } from '../types/piece'
+import { toLocalInput } from './id'
 
 /** 保留 1 位小数 */
 export function round1(value: number): number {
@@ -157,6 +158,65 @@ export function checkSlotConflict(
     }
   }
   return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
+}
+
+/** 窑位阻挡记录：占用该窑位的既有退火记录摘要 */
+export interface SlotBlocker {
+  annealId: string
+  pieceId: string
+  pieceName: string
+  curveSeg: CurveSeg
+  state: AnnealState
+  inAt: string
+  outAt: string
+  /** 有效出炉时间：已出炉取实际 outAt；未出炉按「入窑 + 该段理论时长」取临时出炉时间 */
+  effectiveOutAt: string
+}
+
+/** 单个窑位在候选时间窗下的可用情况 */
+export interface SlotAvailability {
+  kilnSlot: string
+  available: boolean
+  /** 占用该窑位的既有记录（available 为 false 时非空） */
+  blockers: SlotBlocker[]
+}
+
+/**
+ * 列出某台退火窑全部窑位在候选时间窗下的可用情况（分配 / 编辑时先看能不能排）。
+ * 判重沿用 annealWindow：未出炉记录以「入窑 + 该段理论时长」作为临时出炉时间参与判重。
+ * 返回结果按可用优先、窑位号升序排列，方便把能排的排在前面。
+ */
+export function listSlotAvailability(
+  existing: Anneal[],
+  candidate: Pick<Anneal, 'id' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+  kilnCode: string,
+  wallThicknessOf: (pieceId: string) => number,
+  pieceNameOf: (pieceId: string) => string,
+  excludeAnnealId = '',
+): SlotAvailability[] {
+  const ownWindow = annealWindow(candidate, wallThicknessOf(candidate.pieceId))
+  const list = kilnSlots(kilnCode).map((kilnSlot) => {
+    const blockers: SlotBlocker[] = []
+    for (const row of existing) {
+      if (row.id === excludeAnnealId) continue
+      if (row.kilnSlot !== kilnSlot) continue
+      const otherWindow = annealWindow(row, wallThicknessOf(row.pieceId))
+      if (windowsOverlap(ownWindow, otherWindow)) {
+        blockers.push({
+          annealId: row.id,
+          pieceId: row.pieceId,
+          pieceName: pieceNameOf(row.pieceId),
+          curveSeg: row.curveSeg,
+          state: row.state,
+          inAt: row.inAt,
+          outAt: row.outAt,
+          effectiveOutAt: row.outAt !== '' ? row.outAt : toLocalInput(otherWindow[1]),
+        })
+      }
+    }
+    return { kilnSlot, available: blockers.length === 0, blockers }
+  })
+  return list.sort((a, b) => Number(b.available) - Number(a.available) || a.kilnSlot.localeCompare(b.kilnSlot))
 }
 
 /** 生成某台退火窑的窑位列表 */

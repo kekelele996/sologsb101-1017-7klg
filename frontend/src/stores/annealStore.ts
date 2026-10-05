@@ -20,8 +20,10 @@ import {
   checkSlotConflict,
   formatHours,
   kilnSlots,
+  listSlotAvailability,
   segmentHours,
   totalAnnealHours,
+  type SlotAvailability,
   type SlotConflict,
 } from '../utils/thermal'
 import { nowIso, nowLocalInput, uuid } from '../utils/id'
@@ -127,6 +129,24 @@ export const useAnnealStore = defineStore('anneal', () => {
     candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
   ): SlotConflict {
     return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id)
+  }
+
+  /**
+   * 某台退火窑全部窑位在候选时间窗下的可用情况（分配 / 编辑时先看能不能排）。
+   * 未出炉记录以「入窑 + 该段理论时长」为临时出炉时间参与判重。
+   */
+  function slotAvailabilityOf(
+    candidate: Pick<Anneal, 'id' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+    kilnCode: string,
+  ): SlotAvailability[] {
+    return listSlotAvailability(
+      anneals.value,
+      candidate,
+      kilnCode,
+      wallThicknessOf,
+      (pieceId) => pieces.value.find((item) => item.id === pieceId)?.name ?? '（作品已删除）',
+      candidate.id,
+    )
   }
 
   /** 某件作品的退火时长汇总 */
@@ -272,6 +292,7 @@ export const useAnnealStore = defineStore('anneal', () => {
     visibleAnneals,
     wallThicknessOf,
     conflictOf,
+    slotAvailabilityOf,
     durationOf,
     loadAll,
     setFilters,

@@ -19,9 +19,14 @@ export function today(): string {
 
 /** 当前时间 YYYY-MM-DDTHH:mm（用于 datetime-local 输入） */
 export function nowLocalInput(): string {
-  const date = new Date()
+  return toLocalInput(Date.now())
+}
+
+/** 把时间戳 / Date 格式化为 YYYY-MM-DDTHH:mm（datetime-local 输入值） */
+export function toLocalInput(date: Date | number): string {
+  const value = typeof date === 'number' ? new Date(date) : date
   const pad = (n: number): string => String(n).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}T${pad(value.getHours())}:${pad(value.getMinutes())}`
 }
 
 /** 文件名时间戳片段 */
