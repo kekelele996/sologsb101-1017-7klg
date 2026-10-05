@@ -17,12 +17,18 @@ import {
   removeAnneal,
 } from '../utils/db'
 import {
+  annealWindow,
   checkSlotConflict,
+  evaluateSlotAvailability,
   formatHours,
   kilnSlots,
   segmentHours,
   totalAnnealHours,
+  windowRangeText,
+  windowRelation,
+  type SlotAvailability,
   type SlotConflict,
+  type SlotWindowRelation,
 } from '../utils/thermal'
 import { nowIso, nowLocalInput, uuid } from '../utils/id'
 
@@ -34,7 +40,7 @@ export interface AnnealFilters {
   kilnCode: string | 'all'
 }
 
-/** 窑位占用行 */
+/** 窑位占用行（已按窑位、入窑时间排序） */
 export interface SlotOccupancy {
   kilnSlot: string
   annealId: string
@@ -46,6 +52,18 @@ export interface SlotOccupancy {
   state: AnnealState
   /** 该窑位当前是否被未出炉记录占用 */
   occupied: boolean
+  /** 占用时间窗 [起, 止]（毫秒时间戳，未出炉时止点为临时推算） */
+  window: [number, number]
+  /** 出炉时间是否为「入窑 + 该段理论时长」的临时推算 */
+  endEstimated: boolean
+  /** 占用时段文本 */
+  rangeText: string
+  /** 与同窑位上一条记录的衔接关系（首条为 null） */
+  prevRelation: SlotWindowRelation | null
+  /** 与同窑位下一条记录的衔接关系（末条为 null） */
+  nextRelation: SlotWindowRelation | null
+  /** 与任一相邻记录时间重叠（需高亮） */
+  overlap: boolean
 }
 
 const EMPTY_FILTERS: AnnealFilters = { keyword: '', state: 'all', curveSeg: 'all', kilnCode: 'all' }
@@ -74,31 +92,58 @@ export const useAnnealStore = defineStore('anneal', () => {
   const wallThicknessOf = (pieceId: string): number =>
     pieces.value.find((row) => row.id === pieceId)?.wallThicknessMm ?? 4
 
+  /** 作品解析：壁厚用于理论时长换算，名称用于占用说明 */
+  const resolvePiece = (pieceId: string): { name: string; wallThicknessMm: number } => {
+    const piece = pieces.value.find((row) => row.id === pieceId)
+    return { name: piece?.name ?? '（作品已删除）', wallThicknessMm: piece?.wallThicknessMm ?? 4 }
+  }
+
   /** 全部窑位（按已有退火记录推导窑号，兜底 AN-01） */
   const allSlots = computed<string[]>(() => {
     const codes = kilnCodes.value.length > 0 ? kilnCodes.value : ['AN-01']
     return codes.flatMap((code) => kilnSlots(code))
   })
 
-  /** 窑位占用表 */
-  const occupancy = computed<SlotOccupancy[]>(() =>
-    anneals.value
-      .map((row) => {
-        const piece = pieces.value.find((item) => item.id === row.pieceId)
-        return {
-          kilnSlot: row.kilnSlot,
-          annealId: row.id,
-          pieceId: row.pieceId,
-          pieceName: piece?.name ?? '（作品已删除）',
-          curveSeg: row.curveSeg,
-          inAt: row.inAt,
-          outAt: row.outAt,
-          state: row.state,
-          occupied: row.state !== '已出炉',
-        }
-      })
-      .sort((a, b) => a.kilnSlot.localeCompare(b.kilnSlot) || a.inAt.localeCompare(b.inAt))
-  )
+  /**
+   * 窑位占用表：同一窑位的记录按入窑时间排序，
+   * 首尾相接标「接续」，时间窗叠住标「重叠」并由行内标记驱动高亮。
+   */
+  const occupancy = computed<SlotOccupancy[]>(() => {
+    const rows = anneals.value.map((row) => {
+      const piece = pieces.value.find((item) => item.id === row.pieceId)
+      const thickness = piece?.wallThicknessMm ?? 4
+      return {
+        kilnSlot: row.kilnSlot,
+        annealId: row.id,
+        pieceId: row.pieceId,
+        pieceName: piece?.name ?? '（作品已删除）',
+        curveSeg: row.curveSeg,
+        inAt: row.inAt,
+        outAt: row.outAt,
+        state: row.state,
+        occupied: row.state !== '已出炉',
+        window: annealWindow(row, thickness),
+        endEstimated: row.outAt === '',
+        rangeText: windowRangeText(row, thickness),
+      }
+    })
+    rows.sort((a, b) => a.kilnSlot.localeCompare(b.kilnSlot) || a.window[0] - b.window[0] || a.inAt.localeCompare(b.inAt))
+
+    return rows.map((row, index) => {
+      const prev = rows[index - 1]
+      const next = rows[index + 1]
+      const prevRelation =
+        prev && prev.kilnSlot === row.kilnSlot ? windowRelation(prev.window[1], row.window[0]) : null
+      const nextRelation =
+        next && next.kilnSlot === row.kilnSlot ? windowRelation(row.window[1], next.window[0]) : null
+      return {
+        ...row,
+        prevRelation,
+        nextRelation,
+        overlap: prevRelation === '重叠' || nextRelation === '重叠',
+      }
+    })
+  })
 
   const occupiedSlotCount = computed<number>(() => new Set(occupancy.value.filter((row) => row.occupied).map((row) => row.kilnSlot)).size)
   const occupancyRate = computed<number>(() => {
@@ -126,7 +171,14 @@ export const useAnnealStore = defineStore('anneal', () => {
   function conflictOf(
     candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
   ): SlotConflict {
-    return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id)
+    return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id, resolvePiece)
+  }
+
+  /** 单个窑位的可排评估：可用或被哪些记录挡住（编辑时排除自身） */
+  function slotAvailability(
+    candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+  ): SlotAvailability {
+    return evaluateSlotAvailability(anneals.value, candidate, resolvePiece, candidate.id)
   }
 
   /** 某件作品的退火时长汇总 */
@@ -272,6 +324,7 @@ export const useAnnealStore = defineStore('anneal', () => {
     visibleAnneals,
     wallThicknessOf,
     conflictOf,
+    slotAvailability,
     durationOf,
     loadAll,
     setFilters,

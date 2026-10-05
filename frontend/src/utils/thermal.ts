@@ -116,10 +116,132 @@ export function annealWindow(row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg'>, w
   return [start, start + segmentHours(row.curveSeg, wallThicknessMm) * 3600 * 1000]
 }
 
+/** 时间戳 → 「MM-DD HH:mm」短格式，用于占用说明 */
+export function formatStampShort(stamp: number): string {
+  if (Number.isNaN(stamp)) return ''
+  const date = new Date(stamp)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** 时间窗 → 「起 ～ 止」短格式，结束可标注「预计」 */
+export function formatWindowRange(window: [number, number], endEstimated = false): string {
+  if (Number.isNaN(window[0]) || Number.isNaN(window[1])) return ''
+  const suffix = endEstimated ? '（预计）' : ''
+  return `${formatStampShort(window[0])} ～ ${formatStampShort(window[1])}${suffix}`
+}
+
+/** 既有退火记录的占用时间窗文本（未出炉的临时出炉时间标「预计」） */
+export function windowRangeText(row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg'>, wallThicknessMm: number): string {
+  return formatWindowRange(annealWindow(row, wallThicknessMm), row.outAt === '')
+}
+
 /** 两个时间窗是否重叠 */
 export function windowsOverlap(a: [number, number], b: [number, number]): boolean {
   if (Number.isNaN(a[0]) || Number.isNaN(b[0])) return false
   return a[0] < b[1] && b[0] < a[1]
+}
+
+/** 候选排产：编辑场景用 id 排除自身 */
+export interface SlotCandidate {
+  id: string
+  kilnSlot: string
+  inAt: string
+  outAt: string
+  curveSeg: CurveSeg
+  pieceId: string
+}
+
+/** 作品解析：取壁厚用于时长换算，取名称用于占用说明 */
+export interface PieceResolver {
+  (pieceId: string): { name: string; wallThicknessMm: number }
+}
+
+/** 挡住某个窑位的既有记录 */
+export interface SlotBlocker {
+  annealId: string
+  pieceId: string
+  pieceName: string
+  curveSeg: CurveSeg
+  state: Anneal['state']
+  /** 该记录占用的时间窗 [起, 止]（毫秒时间戳） */
+  window: [number, number]
+  /** 出炉时间是否由「入窑 + 该段理论时长」临时推算 */
+  endEstimated: boolean
+  /** 「MM-DD HH:mm ～ MM-DD HH:mm（预计）」 */
+  rangeText: string
+  /** 一句话占用说明 */
+  message: string
+}
+
+/** 单个窑位的可排评估结果 */
+export interface SlotAvailability {
+  kilnSlot: string
+  available: boolean
+  /** 挡住该窑位的全部既有记录（按入窑时间排序） */
+  blockers: SlotBlocker[]
+}
+
+function resolveThickness(resolver: PieceResolver | undefined, pieceId: string): number {
+  return resolver ? resolver(pieceId).wallThicknessMm : 4
+}
+
+function toBlocker(row: Anneal, resolver: PieceResolver | undefined): SlotBlocker {
+  const thickness = resolveThickness(resolver, row.pieceId)
+  const window = annealWindow(row, thickness)
+  const pieceName = resolver?.(row.pieceId).name ?? '（作品已删除）'
+  const endEstimated = row.outAt === ''
+  return {
+    annealId: row.id,
+    pieceId: row.pieceId,
+    pieceName,
+    curveSeg: row.curveSeg,
+    state: row.state,
+    window,
+    endEstimated,
+    rangeText: formatWindowRange(window, endEstimated),
+    message: `作品「${pieceName}」的退火记录 ${row.id}（${row.curveSeg}段·${row.state}）占用 ${formatWindowRange(
+      window,
+      endEstimated,
+    )}${endEstimated ? '，出炉时间为入窑时间加该段理论时长的临时推算' : ''}。`,
+  }
+}
+
+/**
+ * 窑位可排评估：返回该窑位可用与否，以及挡住它的全部记录。
+ * 判重沿用 annealWindow：未出炉记录以「入窑 + 该段理论时长」作为临时出炉时间；
+ * 时间窗首尾相接（半开区间）不算挡住。excludeAnnealId 用于编辑场景排除自身。
+ */
+export function evaluateSlotAvailability(
+  existing: Anneal[],
+  candidate: SlotCandidate,
+  resolver?: PieceResolver,
+  excludeAnnealId = candidate.id,
+): SlotAvailability {
+  const ownWindow = annealWindow(candidate, resolveThickness(resolver, candidate.pieceId))
+  const blockers: SlotBlocker[] = []
+  if (!Number.isNaN(ownWindow[0])) {
+    existing.forEach((row) => {
+      if (row.id === excludeAnnealId) return
+      if (row.kilnSlot !== candidate.kilnSlot) return
+      if (windowsOverlap(ownWindow, annealWindow(row, resolveThickness(resolver, row.pieceId)))) {
+        blockers.push(toBlocker(row, resolver))
+      }
+    })
+  }
+  blockers.sort((a, b) => a.window[0] - b.window[0])
+  return { kilnSlot: candidate.kilnSlot, available: blockers.length === 0, blockers }
+}
+
+/** 同窑位相邻时间窗的衔接关系：接续（首尾相接）/ 重叠 / 间隔 */
+export type SlotWindowRelation = '接续' | '重叠' | '间隔'
+
+/** 前一条记录的止点与后一条记录的起点关系 */
+export function windowRelation(prevEnd: number, nextStart: number): SlotWindowRelation {
+  if (Number.isNaN(prevEnd) || Number.isNaN(nextStart)) return '间隔'
+  if (nextStart < prevEnd) return '重叠'
+  if (nextStart === prevEnd) return '接续'
+  return '间隔'
 }
 
 export interface SlotConflict {
@@ -136,27 +258,24 @@ export interface SlotConflict {
  */
 export function checkSlotConflict(
   existing: Anneal[],
-  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+  candidate: SlotCandidate,
   wallThicknessOf: (pieceId: string) => number,
-  excludeAnnealId = '',
+  excludeAnnealId = candidate.id,
+  resolver?: PieceResolver,
 ): SlotConflict {
-  const ownThickness = wallThicknessOf(candidate.pieceId)
-  const ownWindow = annealWindow(candidate, ownThickness)
-
-  for (const row of existing) {
-    if (row.id === excludeAnnealId) continue
-    if (row.kilnSlot !== candidate.kilnSlot) continue
-    const otherWindow = annealWindow(row, wallThicknessOf(row.pieceId))
-    if (windowsOverlap(ownWindow, otherWindow)) {
-      return {
-        conflict: true,
-        withPieceId: row.pieceId,
-        withAnnealId: row.id,
-        message: `窑位 ${candidate.kilnSlot} 在该时间窗内已被占用（${row.inAt} 起的 ${row.curveSeg} 段），请更换窑位或调整时间。`,
-      }
-    }
+  const result = evaluateSlotAvailability(existing, candidate, resolver, excludeAnnealId)
+  const first = result.blockers[0]
+  if (first === undefined) {
+    return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
   }
-  return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
+  const ownThickness = wallThicknessOf(candidate.pieceId)
+  const ownRange = formatWindowRange(annealWindow(candidate, ownThickness), candidate.outAt === '')
+  return {
+    conflict: true,
+    withPieceId: first.pieceId,
+    withAnnealId: first.annealId,
+    message: `窑位 ${candidate.kilnSlot} 在候选时间窗 ${ownRange} 内无法排产：${first.message}`,
+  }
 }
 
 /** 生成某台退火窑的窑位列表 */
